@@ -6,7 +6,10 @@
 //
 
 import Foundation
-import Starscream
+import NIO
+import NIOSSL
+import NIOWebSocket
+import WebSocketKit
 import Sentry
 
 class DataProxyConnect: DataProxy {
@@ -24,14 +27,19 @@ class DataProxyConnect: DataProxy {
 	
 	private var webSocket: WebSocket?
 	private var handshakeTimer: DispatchSourceTimer?
+	
 	private var pingTimer: DispatchSourceTimer?
 	private static let pingFrequency: TimeInterval = 5 * 60
+	
+	private var pingResponseTimer: DispatchSourceTimer?
+	private static let pingResponseTimeout: TimeInterval = 60
 	
 	private var connectionRecoveryTimer: DispatchSourceTimer?
 	private var connectionRecoveryCount = 0
 	//The max num of attempts before capping the delay time - not before giving up
 	private static let connectionRecoveryCountMax = 8
 	
+	private let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 	private let processingQueue = DispatchQueue(label: Bundle.main.bundleIdentifier! + ".proxy.connect.processing", qos: .utility)
 	
 	private var isActive = false
@@ -42,6 +50,9 @@ class DataProxyConnect: DataProxy {
 	}
 	
 	deinit {
+		//Shut down the event loop
+		try? eventLoopGroup.syncShutdownGracefully()
+		
 		//Ensure the server proxy isn't running when we go out of scope
 		assert(!isActive, "DataProxyConnect was deinitialized while active")
 		
@@ -76,16 +87,53 @@ class DataProxyConnect: DataProxy {
 		var components = URLComponents(string: Bundle.main.infoDictionary!["CONNECT_ENDPOINT"] as! String)!
 		components.queryItems = queryItems
 		
-		//Create the request
-		var urlRequest = URLRequest(url: components.url!)
-		urlRequest.addValue("app", forHTTPHeaderField: "Origin")
+		var headers = HTTPHeaders()
+		headers.add(name: "Origin", value: "app")
 		
 		//Create the WebSocket connection
-		let socket = WebSocket(request: urlRequest)
-		socket.delegate = self
-		socket.callbackQueue = processingQueue
-		socket.connect()
-		webSocket = socket
+		var tlsConfiguration = TLSConfiguration.makeClientConfiguration()
+		if #available(macOS 10.13, *) {
+			
+		} else {
+			let certificates = CertificateTrust.certificateFiles.map { certificateURL in try! NIOSSLCertificate(file: certificateURL.path, format: .der) }
+			tlsConfiguration.additionalTrustRoots = [.certificates(certificates)]
+			tlsConfiguration.trustRoots = .certificates([])
+		}
+		
+		WebSocket.connect(to: components.url!, headers: headers, configuration: WebSocketClient.Configuration(tlsConfiguration: tlsConfiguration), on: eventLoopGroup, onUpgrade: { [weak self] webSocket in
+			//Report open event
+			self?.processingQueue.async { [weak self] in
+				guard let self = self else { return }
+				self.webSocket = webSocket
+				self.onWSConnect()
+			}
+			
+			//Set the listeners
+			webSocket.onBinary { [weak self] _, byteBuffer in
+				self?.processingQueue.async { [weak self] in
+					self?.onWSReceive(data: Data(byteBuffer.readableBytesView))
+				}
+			}
+			webSocket.onClose.whenComplete { [weak self] result in
+				self?.processingQueue.async { [weak self] in
+					switch result {
+						case .failure(let error):
+							self?.onWSError(error: error)
+						case .success(_):
+							self?.onWSDisconnect(withCode: webSocket.closeCode ?? WebSocketErrorCode.normalClosure)
+					}
+				}
+			}
+			webSocket.onPong { [weak self] _ in
+				self?.processingQueue.async { [weak self] in
+					self?.onWSPong()
+				}
+			}
+		}).whenFailure { [weak self] error in
+			self?.processingQueue.async { [weak self] in
+				self?.onWSError(error: error)
+			}
+		}
 		
 		isActive = true
 	}
@@ -106,7 +154,7 @@ class DataProxyConnect: DataProxy {
 			NotificationNames.postUpdateConnectionCount(0)
 			
 			//Disconnect
-			socket.disconnect()
+			_ = socket.close()
 			delegate?.dataProxy(self, didStopWithState: .stopped, isRecoverable: false)
 		}
 		
@@ -153,7 +201,13 @@ class DataProxyConnect: DataProxy {
 		packer.pack(data: secureData)
 		
 		//Send the message
-		socket.write(data: packer.data, completion: onSent)
+		if let onSent = onSent {
+			let promise = eventLoopGroup.next().makePromise(of: Void.self)
+			socket.send([UInt8](packer.data), promise: promise)
+			promise.futureResult.whenSuccess(onSent)
+		} else {
+			socket.send([UInt8](packer.data))
+		}
 	}
 	
 	func send(pushNotification data: Data, version: Int) {
@@ -169,7 +223,7 @@ class DataProxyConnect: DataProxy {
 		packer.pack(data: data)
 		
 		//Send the message
-		socket.write(data: packer.data, completion: nil)
+		socket.send([UInt8](packer.data))
 	}
 	
 	func disconnect(client: ClientConnection) {
@@ -185,7 +239,7 @@ class DataProxyConnect: DataProxy {
 		packer.pack(int: clientID)
 		
 		//Send the message
-		socket.write(data: packer.data, completion: nil)
+		socket.send([UInt8](packer.data))
 		
 		//Remove the client
 		removeClient(clientID: clientID)
@@ -228,7 +282,46 @@ class DataProxyConnect: DataProxy {
 		assertDispatchQueue(processingQueue)
 		
 		//Ping
-		webSocket?.write(ping: Data())
+		webSocket?.sendPing()
+		
+		//Wait for a pong
+		startPingResponseTimer()
+	}
+	
+	private func startPingResponseTimer() {
+		//Make sure we're on the processing queue
+		assertDispatchQueue(processingQueue)
+		
+		//Cancel the old timer
+		pingResponseTimer?.cancel()
+		
+		//Create the new timer
+		let timer = DispatchSource.makeTimerSource(queue: processingQueue)
+		timer.schedule(deadline: .now() + DataProxyConnect.pingResponseTimeout, repeating: .never)
+		timer.setEventHandler(handler: onPingResponseTimer)
+		timer.resume()
+		pingResponseTimer = timer
+	}
+	
+	private func stopPingResponseTimer() {
+		//Make sure we're on the processing queue
+		assertDispatchQueue(processingQueue)
+		
+		pingResponseTimer?.cancel()
+		pingResponseTimer = nil
+	}
+	
+	private func onPingResponseTimer() {
+		//Make sure we're on the processing queue
+		assertDispatchQueue(processingQueue)
+		
+		LogManager.log("Didn't receive a pong response from Connect proxy, disconnecting", level: .info)
+		
+		//Didn't receive a pong from the server in time! Disconnect
+		onWSDisconnect(withCode: .normalClosure)
+		
+		//Disconnect
+		_ = webSocket?.close()
 	}
 	
 	//MARK: Handshake Timer
@@ -261,7 +354,7 @@ class DataProxyConnect: DataProxy {
 		assertDispatchQueue(processingQueue)
 		
 		//Disconnect
-		webSocket?.disconnect()
+		_ = webSocket?.close()
 		
 		//Clean up
 		stopHandshakeTimer()
@@ -314,13 +407,12 @@ class DataProxyConnect: DataProxy {
 		startHandshakeTimer()
 	}
 	
-	private func onWSDisconnect(reason: String, code: UInt16) {
-		LogManager.log("Connection to Connect relay lost: \(code) / \(reason)", level: .info)
+	private func onWSDisconnect(withCode code: WebSocketErrorCode) {
+		LogManager.log("Connection to Connect relay lost: \(code)", level: .info)
 		
-		//Stop the ping timer
+		//Stop timers
 		stopPingTimer()
-		
-		//Cancel the handshake timer
+		stopPingResponseTimer()
 		stopHandshakeTimer()
 		
 		//Update the active state
@@ -331,20 +423,32 @@ class DataProxyConnect: DataProxy {
 		//Map the error code
 		let localError: ServerState
 		switch code {
-			case 1006 /* Abnormal close */, CloseCode.normal.rawValue:
+			case .normalClosure, .unexpectedServerError:
 				localError = .errorInternet
-			case CloseCode.protocolError.rawValue, CloseCode.policyViolated.rawValue:
+			case .protocolError, .policyViolation:
 				localError = .errorConnBadRequest
-			case ConnectCloseCode.incompatibleProtocol.rawValue:
-				localError = .errorConnOutdated
-			case ConnectCloseCode.accountValidation.rawValue:
-				localError = .errorConnValidation
-			case ConnectCloseCode.serverTokenRefresh.rawValue:
-				localError = .errorConnToken
-			case ConnectCloseCode.noActivation.rawValue:
-				localError = .errorConnActivation
-			case ConnectCloseCode.otherLocation.rawValue:
-				localError = .errorConnAccountConflict
+			case .unknown(let rawCode):
+				switch rawCode {
+					//Other WebSocket close codes
+					case 1012, //Server error
+						1013, //Service restart
+						1014, //Try again later
+						1015: //Bad gateway
+						localError = .errorInternet
+					//Custom AirMessage codes
+					case ConnectCloseCode.incompatibleProtocol.rawValue:
+						localError = .errorConnOutdated
+					case ConnectCloseCode.accountValidation.rawValue:
+						localError = .errorConnValidation
+					case ConnectCloseCode.serverTokenRefresh.rawValue:
+						localError = .errorConnToken
+					case ConnectCloseCode.noActivation.rawValue:
+						localError = .errorConnActivation
+					case ConnectCloseCode.otherLocation.rawValue:
+						localError = .errorConnAccountConflict
+					default:
+						localError = .errorExternal
+				}
 			default:
 				localError = .errorExternal
 		}
@@ -480,7 +584,12 @@ class DataProxyConnect: DataProxy {
 		}
 		
 		//Disconnect
-		onWSDisconnect(reason: "", code: CloseCode.normal.rawValue)
+		onWSDisconnect(withCode: .normalClosure)
+	}
+	
+	private func onWSPong() {
+		//Stop the ping response timer
+		stopPingResponseTimer()
 	}
 	
 	//MARK: Message handling
@@ -532,24 +641,5 @@ class DataProxyConnect: DataProxy {
 		
 		//Notify the delegate
 		delegate?.dataProxy(self, didDisconnectClient: client, totalCount: connectionCount)
-	}
-}
-
-//MARK: WebSocket Delegate
-
-extension DataProxyConnect: WebSocketDelegate {
-	func didReceive(event: WebSocketEvent, client: WebSocket) {
-		switch event {
-			case .connected(_): onWSConnect()
-			case .disconnected(let reason, let code): onWSDisconnect(reason: reason, code: code)
-			case .binary(let data): onWSReceive(data: data)
-			case .error(let error): onWSError(error: error)
-			case .cancelled: onWSError(error: nil)
-			case .viabilityChanged(let viable):
-				if !viable {
-					onWSError(error: nil)
-				}
-			default: break
-		}
 	}
 }
