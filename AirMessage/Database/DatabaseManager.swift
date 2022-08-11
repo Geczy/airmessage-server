@@ -543,7 +543,7 @@ class DatabaseManager {
 		
 		let template = try! String(contentsOf: Bundle.main.url(forResource: "QueryAllChatSummary", withExtension: "sql", subdirectory: "SQL")!)
 		let query = String(format: template, extraRows.isEmpty ? "" : ", " + extraRows.map { "\($0) AS \"\($0)\"" }.joined(separator: ", "))
-		let stmt = try dbConnection.prepare(query)
+		let stmt = try dbConnection.run(query)
 		let indices = DatabaseConverter.makeColumnIndexDict(stmt.columnNames)
 		
 		return stmt.map { row in DatabaseConverter.processLiteConversationRow(row, withIndices: indices) }
@@ -571,6 +571,7 @@ class DatabaseManager {
 			sort: "message.ROWID DESC",
 			bindings: fetchBindings
 		)
+        print(stmt, chatGUID)
 		let indices = DatabaseConverter.makeColumnIndexDict(stmt.columnNames)
 		
 		/*
@@ -584,9 +585,12 @@ class DatabaseManager {
 		 */
 		var conversationItemArray: [ConversationItem] = []
 		var isolatedModifierDict: [String: [ModifierInfo]] = [:]
+        
+        print("ready for loop")
 		
 		//Collect up to 24 message items
 		while conversationItemArray.count < 24 {
+            print("looping")
 			let row = try stmt.failableNext()
 			
 			//End of iterator, exit loop

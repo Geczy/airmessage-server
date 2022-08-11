@@ -1115,7 +1115,7 @@ DQ
         <scene sceneID="bkz-yt-8qH">
             <objects>
                 <viewController id="2am-CR-TqS" customClass="FullDiskAccessViewController" customModule="AirMessage" customModuleProvider="target" sceneMemberID="viewController">
-                    <view key="view" misplaced="YES" id="CWi-KJ-5Pc">
+                    <view key="view" id="CWi-KJ-5Pc">
                         <rect key="frame" x="0.0" y="0.0" width="440" height="771"/>
                         <autoresizingMask key="autoresizingMask"/>
                         <subviews>
@@ -1503,7 +1503,7 @@ DQ
         <scene sceneID="d7c-M2-DyW">
             <objects>
                 <viewController id="hja-eM-bID" customClass="AutomationAccessViewController" customModule="AirMessage" customModuleProvider="target" sceneMemberID="viewController">
-                    <view key="view" misplaced="YES" id="iW0-A4-GC8">
+                    <view key="view" id="iW0-A4-GC8">
                         <rect key="frame" x="0.0" y="0.0" width="440" height="603"/>
                         <autoresizingMask key="autoresizingMask"/>
                         <subviews>
@@ -1838,7 +1838,7 @@ DQ
         <scene sceneID="5ep-ML-nt2">
             <objects>
                 <viewController id="hJV-Pf-rNN" customClass="AccessibilityAccessViewController" customModule="AirMessage" customModuleProvider="target" sceneMemberID="viewController">
-                    <view key="view" misplaced="YES" id="TJL-1G-Ah3">
+                    <view key="view" id="TJL-1G-Ah3">
                         <rect key="frame" x="0.0" y="0.0" width="440" height="743"/>
                         <autoresizingMask key="autoresizingMask"/>
                         <subviews>
